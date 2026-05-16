@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
 import { useEffect, useRef, useState } from 'react';
+
 import {
     ActivityIndicator,
     Alert,
@@ -14,8 +15,10 @@ import {
     TouchableOpacity,
     View,
 } from 'react-native';
+
 import { initDB } from '../../database/db';
 import { guardarAsistencia } from '../../services/asistenciaService';
+import { getCurrentAppTime, syncServerTime } from '../../services/timeService';
 
 export default function Home() {
     const [email, setEmail] = useState('');
@@ -25,55 +28,38 @@ export default function Home() {
     const [loading, setLoading] = useState(false);
     const [locationLoading, setLocationLoading] = useState(true);
     const [currentTime, setCurrentTime] = useState('');
-    const [isAutoTimeEnabled, setIsAutoTimeEnabled] = useState<boolean | null>(null);
-    const [timeError, setTimeError] = useState('');
-
-    const lastTimeRef = useRef<Date>(new Date());
+    const [locationError, setLocationError] = useState<string | null>(null);
+    const [usingBalancedMode, setUsingBalancedMode] = useState(false);
+    
+    const locationRetryCount = useRef(0);
+    const maxRetries = 3;
 
     useEffect(() => {
-        // Inicializar siempre, sin importar qué
         initDB().catch(console.log);
-        getLocation();
-        updateCurrentTime();
+        getLocationWithRetry();
+        initializeTime();
 
-        // Hacer la verificación de forma segura (que no rompa la app)
-        setTimeout(() => {
-            verifyAutoTimeSafely();
+        const interval = setInterval(() => {
+            updateCurrentTime();
         }, 1000);
 
-        const interval = setInterval(updateCurrentTime, 1000);
-
-        return () => {
-            clearInterval(interval);
-        };
+        return () => clearInterval(interval);
     }, []);
 
-    // Verificación SEGURA que NO rompe la app
-    const verifyAutoTimeSafely = async () => {
+    const initializeTime = async () => {
         try {
-            const test1 = Date.now();
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            const test2 = Date.now();
-
-            const diff = test2 - test1;
-
-            if (diff > 50 && diff < 200) {
-                setIsAutoTimeEnabled(true);
-                setTimeError('');
-            } else {
-                setIsAutoTimeEnabled(false);
-                setTimeError('⚠️ La hora del dispositivo podría no ser precisa');
-            }
-        } catch {
-            setIsAutoTimeEnabled(null);
+            await syncServerTime();
+            await updateCurrentTime();
+        } catch (error) {
+            console.log('Error inicializando hora:', error);
         }
     };
 
-    const updateCurrentTime = () => {
+    const updateCurrentTime = async () => {
         try {
-            const now = new Date();
-            const formattedTime = formatDateTime(now);
-            setCurrentTime(formattedTime);
+            const now = await getCurrentAppTime();
+            const formatted = formatDateTime(now);
+            setCurrentTime(formatted);
         } catch (error) {
             console.log('Error actualizando hora:', error);
         }
@@ -86,91 +72,216 @@ export default function Home() {
         const hours = String(date.getHours()).padStart(2, '0');
         const minutes = String(date.getMinutes()).padStart(2, '0');
         const seconds = String(date.getSeconds()).padStart(2, '0');
-
         return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
     };
 
-    const getLocation = async () => {
-        try {
-            setLocationLoading(true);
-            let { status } = await Location.requestForegroundPermissionsAsync();
+    const getLocationWithRetry = async () => {
+        setLocationLoading(true);
+        setLocationError(null);
+        locationRetryCount.current = 0;
+        
+        await attemptGetLocation();
+    };
 
-            if (status !== 'granted') {
-                Alert.alert('Permiso denegado', 'Se necesita ubicación para registrar asistencia.');
+    const attemptGetLocation = async () => {
+        try {
+            // Primero intentar con alta precisión
+            console.log('Intentando obtener ubicación con alta precisión...');
+            const location = await getLocationWithAccuracy(Location.Accuracy.High);
+            
+            if (location) {
+                console.log('✅ Ubicación obtenida con alta precisión');
+                setLocation(location);
+                setUsingBalancedMode(false);
+                setLocationError(null);
                 setLocationLoading(false);
                 return;
             }
+        } catch (error: any) {
+            console.log('GPS de alta precisión falló:', error.message);
+            
+            // Si falla, intentar con modo balanceado
+            if (locationRetryCount.current < maxRetries) {
+                locationRetryCount.current++;
+                console.log(`Reintento ${locationRetryCount.current}/${maxRetries} con modo balanceado...`);
+                
+                try {
+                    const balancedLocation = await getLocationWithAccuracy(Location.Accuracy.Balanced);
+                    
+                    if (balancedLocation) {
+                        console.log('✅ Ubicación obtenida con modo balanceado');
+                        setLocation(balancedLocation);
+                        setUsingBalancedMode(true);
+                        setLocationError(null);
+                        setLocationLoading(false);
+                        
+                        // Mostrar alerta informativa solo una vez
+                        if (locationRetryCount.current === 1) {
+                            Alert.alert(
+                                '⚠️ Precisión reducida',
+                                'Usando ubicación aproximada. La precisión puede ser menor.',
+                                [{ text: 'Entendido' }]
+                            );
+                        }
+                        return;
+                    }
+                } catch (balancedError: any) {
+                    console.log('Modo balanceado también falló:', balancedError.message);
+                }
+            }
+        }
+        
+        // Si todos los intentos fallaron
+        setLocation(null);
+        setLocationLoading(false);
+        setLocationError('No se pudo obtener la ubicación. Verifica que los servicios de ubicación estén activados.');
+        
+        Alert.alert(
+            '❌ Error de Ubicación',
+            'No se pudo obtener tu ubicación. Por favor:\n\n' +
+            '1. Activa el GPS de tu dispositivo\n' +
+            '2. Permite el acceso a la ubicación\n' +
+            '3. Verifica que tengas señal GPS\n\n' +
+            '¿Quieres reintentar?',
+            [
+                { text: 'Cancelar', style: 'cancel' },
+                { 
+                    text: 'Reintentar', 
+                    onPress: () => getLocationWithRetry()
+                }
+            ]
+        );
+    };
 
-            let loc = await Location.getCurrentPositionAsync({
-                accuracy: Location.Accuracy.High,
-            });
-            setLocation(loc.coords);
-        } catch (error) {
-            console.log('Error de ubicación:', error);
-            Alert.alert('Error', 'No se pudo obtener tu ubicación');
-        } finally {
-            setLocationLoading(false);
+    const getLocationWithAccuracy = async (accuracy: Location.Accuracy) => {
+        try {
+            // Solicitar permisos
+            const { status } = await Location.requestForegroundPermissionsAsync();
+            
+            if (status !== 'granted') {
+                throw new Error('Permiso de ubicación denegado');
+            }
+
+            // Configurar opciones según precisión
+            const options: Location.LocationOptions = {
+                accuracy: accuracy,
+                timeout: accuracy === Location.Accuracy.High ? 15000 : 10000, // 15s para GPS, 10s para balanceado
+                maximumAge: accuracy === Location.Accuracy.High ? 1000 : 5000, // 1s para GPS, 5s para balanceado
+            };
+
+            // Intentar obtener ubicación
+            const location = await Location.getCurrentPositionAsync(options);
+            
+            // Validar que la ubicación sea razonable
+            if (location && location.coords) {
+                // Verificar que las coordenadas no sean cero
+                if (location.coords.latitude === 0 && location.coords.longitude === 0) {
+                    throw new Error('Coordenadas inválidas (0,0)');
+                }
+                
+                // Verificar precisión si es modo GPS
+                if (accuracy === Location.Accuracy.High && location.coords.accuracy > 100) {
+                    console.log(`Precisión baja en modo GPS: ${location.coords.accuracy}m`);
+                    // Aún así la devolvemos, pero con advertencia
+                }
+                
+                return location.coords;
+            }
+            
+            throw new Error('No se recibieron coordenadas válidas');
+            
+        } catch (error: any) {
+            console.log(`Error en getLocationWithAccuracy (${accuracy}):`, error.message);
+            
+            // Errores específicos
+            if (error.message.includes('LOCATION_UNAVAILABLE')) {
+                throw new Error('GPS no disponible');
+            } else if (error.message.includes('TIMEOUT')) {
+                throw new Error('Tiempo de espera agotado');
+            }
+            
+            throw error;
         }
     };
 
     const saveAttendance = async () => {
-        setLoading(true);
         try {
-            const [datePart, timePart] = currentTime.split(' ');
-            const fecha = datePart;
-            const hora = timePart;
+            setLoading(true);
+
+            const [fecha, hora] = currentTime.split(' ');
 
             await guardarAsistencia({
                 email,
                 tipo,
-                lat: location?.latitude?.toString() || '',
-                lng: location?.longitude?.toString() || '',
                 observacion,
                 fecha,
                 hora,
+                lat: location?.latitude?.toString() || '',
+                lng: location?.longitude?.toString() || '',
             });
 
-            Alert.alert('✅ Éxito', `Asistencia registrada correctamente\nHora: ${currentTime}`);
+            const precisionMsg = usingBalancedMode ? 
+                '\n⚠️ Ubicación con precisión reducida' : 
+                '\n✅ Ubicación precisa (GPS)';
+
+            Alert.alert(
+                '✅ Éxito',
+                `Asistencia registrada\n\n` +
+                `Hora: ${currentTime}\n` +
+                `Latitud: ${location?.latitude}\n` +
+                `Longitud: ${location?.longitude}\n` +
+                `Precisión: ${location?.accuracy?.toFixed(1) || 'N/A'}m${precisionMsg}`
+            );
+
             setEmail('');
             setObservacion('');
+            
+            // Opcional: refrescar ubicación después de guardar
+            setTimeout(() => {
+                getLocationWithRetry();
+            }, 1000);
+            
         } catch (error) {
-            Alert.alert('❌ Error', 'No se pudo registrar la asistencia');
+            console.log('Error guardando asistencia:', error);
+            Alert.alert(
+                '❌ Error',
+                'No se pudo guardar la asistencia. Intenta nuevamente.'
+            );
         } finally {
             setLoading(false);
         }
     };
 
     const handleGuardar = async () => {
-        if (isAutoTimeEnabled === false) {
-            Alert.alert(
-                'Advertencia',
-                'Tu dispositivo podría tener hora incorrecta. El registro se guardará de todas formas.'
-            );
-        }
-
         if (!email) {
-            Alert.alert('Error', 'Por favor ingresa tu email');
+            Alert.alert('Error', 'Ingresa un email');
             return;
         }
 
-        if (!email.includes('@') || !email.includes('.')) {
-            Alert.alert('Error', 'Por favor ingresa un email válido');
+        if (!email.includes('@')) {
+            Alert.alert('Error', 'Email inválido');
             return;
         }
 
         if (!location) {
-            Alert.alert('Error', 'Obteniendo ubicación... Por favor espera.');
+            Alert.alert(
+                'Error', 
+                locationError || 'No hay ubicación disponible. Espera a que se obtenga o toca el botón de reintentar.'
+            );
             return;
         }
 
         saveAttendance();
     };
 
-    // SIEMPRE renderiza el formulario, sin importar el estado
+    const handleRefreshLocation = () => {
+        getLocationWithRetry();
+    };
+
     return (
         <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
             style={styles.container}
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         >
             <ScrollView contentContainerStyle={styles.scrollContainer}>
                 <View style={styles.header}>
@@ -180,145 +291,56 @@ export default function Home() {
                 </View>
 
                 <View style={styles.formContainer}>
-                    {/* Banner de estado de hora */}
-                    {isAutoTimeEnabled === null ? (
-                        <View style={styles.checkingBanner}>
-                            <ActivityIndicator size="small" color="#F39C12" />
-                            <Text style={styles.checkingText}>
-                                Verificando configuración de hora...
-                            </Text>
+                    <View style={styles.serverBanner}>
+                        <Ionicons name="cloud-done-outline" size={22} color="#27AE60" />
+                        <View style={{ flex: 1 }}>
+                            <Text style={styles.serverTitle}>Hora del servidor</Text>
+                            <Text style={styles.serverText}>La app NO usa la hora del celular</Text>
                         </View>
-                    ) : isAutoTimeEnabled === true ? (
-                        <View style={styles.successBanner}>
-                            <Ionicons name="checkmark-circle" size={24} color="#27AE60" />
-                            <View style={styles.bannerContent}>
-                                <Text style={styles.successTitle}>✅ Hora automática activada</Text>
-                                <Text style={styles.successText}>
-                                    Puedes registrar asistencia normalmente
-                                </Text>
-                            </View>
-                        </View>
-                    ) : (
-                        <View style={styles.errorBanner}>
-                            <Ionicons name="alert-circle" size={24} color="#E74C3C" />
-                            <View style={styles.bannerContent}>
-                                <Text style={styles.errorTitle}>
-                                    ⛔ HORA AUTOMÁTICA DESACTIVADA
-                                </Text>
-                                <Text style={styles.errorText}>
-                                    {timeError || 'Activa la hora automática para registrar'}
-                                </Text>
-                                <TouchableOpacity
-                                    style={styles.fixButton}
-                                    onPress={verifyAutoTimeSafely}
-                                >
-                                    <Ionicons name="refresh-outline" size={16} color="#FFF" />
-                                    <Text style={styles.fixButtonText}>Verificar ahora</Text>
-                                </TouchableOpacity>
-                            </View>
-                        </View>
-                    )}
+                    </View>
 
                     <View style={styles.inputGroup}>
                         <Text style={styles.label}>Email</Text>
                         <View style={styles.inputWrapper}>
-                            <Ionicons
-                                name="mail-outline"
-                                size={20}
-                                color="#999"
-                                style={styles.inputIcon}
-                            />
+                            <Ionicons name="mail-outline" size={20} color="#999" style={styles.inputIcon} />
                             <TextInput
                                 value={email}
                                 onChangeText={setEmail}
-                                placeholder="usuario@ejemplo.com"
+                                placeholder="usuario@correo.com"
                                 placeholderTextColor="#999"
                                 style={styles.input}
-                                keyboardType="email-address"
                                 autoCapitalize="none"
-                                editable={!loading && isAutoTimeEnabled === true}
+                                keyboardType="email-address"
                             />
                         </View>
                     </View>
 
                     <View style={styles.inputGroup}>
-                        <Text style={styles.label}>Hora Actual</Text>
-                        <View
-                            style={[
-                                styles.timeWrapper,
-                                isAutoTimeEnabled === false && styles.timeWrapperError,
-                            ]}
-                        >
-                            <Ionicons
-                                name="time-outline"
-                                size={20}
-                                color={isAutoTimeEnabled === true ? '#4A90E2' : '#E74C3C'}
-                                style={styles.inputIcon}
-                            />
-                            <Text
-                                style={[
-                                    styles.timeText,
-                                    isAutoTimeEnabled === false && styles.timeTextError,
-                                ]}
-                            >
-                                {currentTime || 'Cargando...'}
-                            </Text>
-                            {isAutoTimeEnabled === true && (
-                                <Ionicons
-                                    name="checkmark-circle"
-                                    size={20}
-                                    color="#27AE60"
-                                    style={styles.timeIcon}
-                                />
-                            )}
+                        <Text style={styles.label}>Hora Servidor</Text>
+                        <View style={styles.timeWrapper}>
+                            <Ionicons name="time-outline" size={20} color="#4A90E2" style={styles.inputIcon} />
+                            <Text style={styles.timeText}>{currentTime || 'Cargando...'}</Text>
+                            <Ionicons name="checkmark-circle" size={20} color="#27AE60" style={styles.timeIcon} />
                         </View>
                     </View>
 
                     <View style={styles.inputGroup}>
-                        <Text style={styles.label}>Tipo de Registro</Text>
+                        <Text style={styles.label}>Tipo</Text>
                         <View style={styles.tipoContainer}>
                             <TouchableOpacity
-                                style={[
-                                    styles.tipoButton,
-                                    tipo === 'Ingreso' && styles.tipoButtonActive,
-                                ]}
+                                style={[styles.tipoButton, tipo === 'Ingreso' && styles.tipoButtonIngreso]}
                                 onPress={() => setTipo('Ingreso')}
-                                disabled={loading || isAutoTimeEnabled !== true}
                             >
-                                <Ionicons
-                                    name="log-in-outline"
-                                    size={20}
-                                    color={tipo === 'Ingreso' ? '#FFF' : '#4A90E2'}
-                                />
-                                <Text
-                                    style={[
-                                        styles.tipoButtonText,
-                                        tipo === 'Ingreso' && styles.tipoButtonTextActive,
-                                    ]}
-                                >
+                                <Text style={[styles.tipoButtonText, tipo === 'Ingreso' && styles.tipoButtonTextActive]}>
                                     Ingreso
                                 </Text>
                             </TouchableOpacity>
 
                             <TouchableOpacity
-                                style={[
-                                    styles.tipoButton,
-                                    tipo === 'Salida' && styles.tipoButtonActiveSalida,
-                                ]}
+                                style={[styles.tipoButton, tipo === 'Salida' && styles.tipoButtonSalida]}
                                 onPress={() => setTipo('Salida')}
-                                disabled={loading || isAutoTimeEnabled !== true}
                             >
-                                <Ionicons
-                                    name="log-out-outline"
-                                    size={20}
-                                    color={tipo === 'Salida' ? '#FFF' : '#E74C3C'}
-                                />
-                                <Text
-                                    style={[
-                                        styles.tipoButtonText,
-                                        tipo === 'Salida' && styles.tipoButtonTextActive,
-                                    ]}
-                                >
+                                <Text style={[styles.tipoButtonText, tipo === 'Salida' && styles.tipoButtonTextActive]}>
                                     Salida
                                 </Text>
                             </TouchableOpacity>
@@ -328,41 +350,73 @@ export default function Home() {
                     <View style={styles.inputGroup}>
                         <Text style={styles.label}>Observación</Text>
                         <View style={styles.inputWrapper}>
-                            <Ionicons
-                                name="document-text-outline"
-                                size={20}
-                                color="#999"
-                                style={styles.inputIcon}
-                            />
+                            <Ionicons name="document-text-outline" size={20} color="#999" style={styles.inputIcon} />
                             <TextInput
                                 value={observacion}
                                 onChangeText={setObservacion}
                                 placeholder="Opcional"
                                 placeholderTextColor="#999"
                                 style={styles.input}
-                                editable={!loading && isAutoTimeEnabled === true}
                             />
                         </View>
                     </View>
 
                     <View style={styles.locationInfo}>
-                        <Ionicons name="location-outline" size={20} color="#4A90E2" />
+                        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                                <Ionicons name="location-outline" size={20} color="#4A90E2" />
+                                <Text style={styles.locationTitle}>Ubicación</Text>
+                            </View>
+                            <TouchableOpacity onPress={handleRefreshLocation}>
+                                <Ionicons name="refresh-outline" size={20} color="#4A90E2" />
+                            </TouchableOpacity>
+                        </View>
+
                         {locationLoading ? (
-                            <ActivityIndicator size="small" color="#4A90E2" />
+                            <View style={{ alignItems: 'center', padding: 20 }}>
+                                <ActivityIndicator size="large" color="#4A90E2" />
+                                <Text style={styles.loadingText}>Obteniendo ubicación...</Text>
+                            </View>
                         ) : location ? (
-                            <Text style={styles.locationText}>📍 Ubicación disponible</Text>
+                            <View style={{ flex: 1 }}>
+                                {usingBalancedMode && (
+                                    <View style={styles.warningBadge}>
+                                        <Ionicons name="warning-outline" size={14} color="#E67E22" />
+                                        <Text style={styles.warningText}>Precisión reducida</Text>
+                                    </View>
+                                )}
+                                
+                                <Text style={styles.locationText}>📍 Ubicación obtenida</Text>
+                                <Text style={styles.coords}>LAT: {location.latitude.toFixed(6)}</Text>
+                                <Text style={styles.coords}>LNG: {location.longitude.toFixed(6)}</Text>
+                                {location.accuracy && (
+                                    <Text style={styles.coords}>Precisión: ±{location.accuracy.toFixed(1)}m</Text>
+                                )}
+
+                                <TouchableOpacity
+                                    onPress={() => {
+                                        const url = `https://www.google.com/maps?q=${location.latitude},${location.longitude}`;
+                                        Linking.openURL(url);
+                                    }}
+                                    style={styles.mapButton}
+                                >
+                                    <Ionicons name="map-outline" size={18} color="#FFF" />
+                                    <Text style={styles.mapButtonText}>Ver en Google Maps</Text>
+                                </TouchableOpacity>
+                            </View>
                         ) : (
-                            <Text style={styles.locationError}>
-                                ❌ No se pudo obtener ubicación
-                            </Text>
+                            <View>
+                                <Text style={styles.locationError}>❌ {locationError || 'Sin ubicación'}</Text>
+                                <TouchableOpacity onPress={handleRefreshLocation} style={styles.retryButton}>
+                                    <Ionicons name="refresh" size={16} color="#4A90E2" />
+                                    <Text style={styles.retryButtonText}>Reintentar</Text>
+                                </TouchableOpacity>
+                            </View>
                         )}
                     </View>
 
                     <TouchableOpacity
-                        style={[
-                            styles.submitButton,
-                            (loading || isAutoTimeEnabled !== true) && styles.submitButtonDisabled,
-                        ]}
+                        style={[styles.submitButton, (loading || locationLoading) && styles.submitButtonDisabled]}
                         onPress={handleGuardar}
                         disabled={loading || locationLoading}
                     >
@@ -371,34 +425,10 @@ export default function Home() {
                         ) : (
                             <>
                                 <Ionicons name="checkmark-circle-outline" size={24} color="#FFF" />
-                                <Text style={styles.submitButtonText}>Registrar Asistencia</Text>
+                                <Text style={styles.submitButtonText}>Registrar</Text>
                             </>
                         )}
                     </TouchableOpacity>
-
-                    {isAutoTimeEnabled === false && (
-                        <View style={styles.instructionsBox}>
-                            <Ionicons name="settings-outline" size={20} color="#E74C3C" />
-                            <View style={styles.instructionsContent}>
-                                <Text style={styles.instructionsTitle}>
-                                    📱 Cómo activar hora automática:
-                                </Text>
-                                <Text style={styles.instructionsText}>
-                                    {Platform.OS === 'android'
-                                        ? 'Configuración → Sistema → Fecha y hora → Activar "Hora automática"'
-                                        : 'Configuración → General → Fecha y hora → Activar "Automática"'}
-                                </Text>
-                                <TouchableOpacity
-                                    style={styles.openSettingsButton}
-                                    onPress={() => Linking.openSettings()}
-                                >
-                                    <Text style={styles.openSettingsText}>
-                                        Abrir Configuración →
-                                    </Text>
-                                </TouchableOpacity>
-                            </View>
-                        </View>
-                    )}
                 </View>
             </ScrollView>
         </KeyboardAvoidingView>
@@ -434,88 +464,28 @@ const styles = StyleSheet.create({
         backgroundColor: '#FFF',
         borderRadius: 20,
         padding: 24,
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: 2 },
-        shadowOpacity: 0.1,
-        shadowRadius: 10,
         elevation: 5,
     },
-    checkingBanner: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        backgroundColor: '#FFFBEB',
-        padding: 16,
-        borderRadius: 12,
-        marginBottom: 20,
-        gap: 12,
-        borderWidth: 1,
-        borderColor: '#F39C12',
-    },
-    checkingText: {
-        fontSize: 14,
-        color: '#F39C12',
-        flex: 1,
-    },
-    successBanner: {
+    serverBanner: {
         flexDirection: 'row',
         alignItems: 'center',
         backgroundColor: '#F0FFF4',
-        padding: 16,
-        borderRadius: 12,
-        marginBottom: 20,
-        gap: 12,
         borderWidth: 1,
         borderColor: '#27AE60',
+        padding: 14,
+        borderRadius: 12,
+        marginBottom: 20,
+        gap: 10,
     },
-    successTitle: {
+    serverTitle: {
         fontSize: 14,
         fontWeight: 'bold',
         color: '#27AE60',
     },
-    successText: {
+    serverText: {
         fontSize: 12,
         color: '#229954',
         marginTop: 2,
-    },
-    errorBanner: {
-        flexDirection: 'row',
-        backgroundColor: '#FFF5F5',
-        padding: 16,
-        borderRadius: 12,
-        marginBottom: 20,
-        gap: 12,
-        borderWidth: 2,
-        borderColor: '#E74C3C',
-    },
-    errorTitle: {
-        fontSize: 14,
-        fontWeight: 'bold',
-        color: '#E74C3C',
-    },
-    errorText: {
-        fontSize: 12,
-        color: '#C0392B',
-        marginTop: 2,
-    },
-    bannerContent: {
-        flex: 1,
-    },
-    fixButton: {
-        backgroundColor: '#E74C3C',
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'center',
-        paddingHorizontal: 12,
-        paddingVertical: 6,
-        borderRadius: 8,
-        marginTop: 8,
-        gap: 6,
-        alignSelf: 'flex-start',
-    },
-    fixButtonText: {
-        color: '#FFF',
-        fontSize: 12,
-        fontWeight: '600',
     },
     inputGroup: {
         marginBottom: 20,
@@ -551,20 +521,12 @@ const styles = StyleSheet.create({
         borderRadius: 12,
         backgroundColor: '#F0F7FF',
     },
-    timeWrapperError: {
-        borderColor: '#E74C3C',
-        backgroundColor: '#FFF5F5',
-    },
     timeText: {
         flex: 1,
         padding: 12,
         fontSize: 16,
-        fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-        color: '#2C3E50',
         fontWeight: '600',
-    },
-    timeTextError: {
-        color: '#E74C3C',
+        color: '#2C3E50',
     },
     timeIcon: {
         paddingRight: 12,
@@ -575,26 +537,20 @@ const styles = StyleSheet.create({
     },
     tipoButton: {
         flex: 1,
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'center',
         padding: 12,
         borderRadius: 12,
+        alignItems: 'center',
         borderWidth: 2,
-        borderColor: '#E1E8ED',
-        backgroundColor: '#FFF',
-        gap: 8,
     },
-    tipoButtonActive: {
+    tipoButtonIngreso: {
         backgroundColor: '#4A90E2',
         borderColor: '#4A90E2',
     },
-    tipoButtonActiveSalida: {
+    tipoButtonSalida: {
         backgroundColor: '#E74C3C',
         borderColor: '#E74C3C',
     },
     tipoButtonText: {
-        fontSize: 14,
         fontWeight: '600',
         color: '#4A90E2',
     },
@@ -602,29 +558,84 @@ const styles = StyleSheet.create({
         color: '#FFF',
     },
     locationInfo: {
-        flexDirection: 'row',
-        alignItems: 'center',
         backgroundColor: '#F0F7FF',
         padding: 12,
         borderRadius: 12,
         marginBottom: 24,
-        gap: 8,
+    },
+    locationTitle: {
+        fontWeight: 'bold',
+        color: '#2C3E50',
+    },
+    loadingText: {
+        marginTop: 8,
+        color: '#7F8C8D',
+    },
+    warningBadge: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#FEF5E7',
+        paddingHorizontal: 8,
+        paddingVertical: 4,
+        borderRadius: 6,
+        marginBottom: 8,
+        alignSelf: 'flex-start',
+        gap: 4,
+    },
+    warningText: {
+        fontSize: 11,
+        color: '#E67E22',
     },
     locationText: {
-        fontSize: 14,
         color: '#4A90E2',
-        flex: 1,
+        fontWeight: 'bold',
+        marginTop: 4,
+    },
+    coords: {
+        fontSize: 12,
+        color: '#2C3E50',
+        marginTop: 2,
     },
     locationError: {
-        fontSize: 14,
         color: '#E74C3C',
-        flex: 1,
+        marginBottom: 8,
+    },
+    mapButton: {
+        marginTop: 12,
+        backgroundColor: '#4A90E2',
+        paddingVertical: 10,
+        paddingHorizontal: 14,
+        borderRadius: 10,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 8,
+    },
+    mapButtonText: {
+        color: '#FFF',
+        fontWeight: '600',
+    },
+    retryButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 6,
+        paddingVertical: 8,
+        paddingHorizontal: 12,
+        backgroundColor: '#E8F0FE',
+        borderRadius: 8,
+        marginTop: 8,
+    },
+    retryButtonText: {
+        color: '#4A90E2',
+        fontWeight: '500',
+        fontSize: 13,
     },
     submitButton: {
         backgroundColor: '#4A90E2',
         flexDirection: 'row',
-        alignItems: 'center',
         justifyContent: 'center',
+        alignItems: 'center',
         padding: 16,
         borderRadius: 12,
         gap: 8,
@@ -633,41 +644,8 @@ const styles = StyleSheet.create({
         backgroundColor: '#BDC3C7',
     },
     submitButtonText: {
-        fontSize: 16,
-        fontWeight: '600',
         color: '#FFF',
-    },
-    instructionsBox: {
-        flexDirection: 'row',
-        backgroundColor: '#FFF5F5',
-        padding: 16,
-        borderRadius: 12,
-        marginTop: 16,
-        gap: 12,
-        borderWidth: 1,
-        borderColor: '#E74C3C',
-    },
-    instructionsContent: {
-        flex: 1,
-    },
-    instructionsTitle: {
-        fontSize: 13,
-        fontWeight: 'bold',
-        color: '#E74C3C',
-        marginBottom: 6,
-    },
-    instructionsText: {
-        fontSize: 12,
-        color: '#7F8C8D',
-        lineHeight: 18,
-        marginBottom: 8,
-    },
-    openSettingsButton: {
-        alignSelf: 'flex-start',
-    },
-    openSettingsText: {
-        fontSize: 12,
-        color: '#4A90E2',
         fontWeight: '600',
+        fontSize: 16,
     },
 });
