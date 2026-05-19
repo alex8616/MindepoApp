@@ -1,43 +1,69 @@
 import { Ionicons } from '@expo/vector-icons';
+import * as Device from 'expo-device';
 import * as Location from 'expo-location';
+import { router, useNavigation } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-
-import {
-    ActivityIndicator,
-    Alert,
-    KeyboardAvoidingView,
-    Linking,
-    Platform,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
-} from 'react-native';
-
+import { ActivityIndicator, Alert, Animated, Dimensions, KeyboardAvoidingView, Linking, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { useAuth } from '../../contexts/AuthContext'; // Importa el hook
 import { initDB } from '../../database/db';
 import { guardarAsistencia } from '../../services/asistenciaService';
 import { getCurrentAppTime, syncServerTime } from '../../services/timeService';
 
 export default function Home() {
+    const { user, logout } = useAuth();
+
     const [email, setEmail] = useState('');
     const [tipo, setTipo] = useState('Ingreso');
     const [observacion, setObservacion] = useState('');
     const [location, setLocation] = useState<any>(null);
     const [loading, setLoading] = useState(false);
-    const [locationLoading, setLocationLoading] = useState(true);
+    const [locationLoading, setLocationLoading] = useState(false);
     const [currentTime, setCurrentTime] = useState('');
     const [locationError, setLocationError] = useState<string | null>(null);
-    const [usingBalancedMode, setUsingBalancedMode] = useState(false);
     
-    const locationRetryCount = useRef(0);
-    const maxRetries = 3;
+    const navigation = useNavigation();
+    const [menuVisible, setMenuVisible] = useState(false);
+    const slideAnim = useRef(new Animated.Value(-Dimensions.get('window').width)).current;
+
+    // Establecer email del usuario cuando esté disponible
+    useEffect(() => {
+        if (user?.email) {
+            setEmail(user.email);
+        }
+    }, [user]);
+
+    const openMenu = () => {
+        setMenuVisible(true);
+        Animated.timing(slideAnim, {
+            toValue: 0,
+            duration: 250,
+            useNativeDriver: true,
+        }).start();
+    };
+
+    const closeMenu = () => {
+        Animated.timing(slideAnim, {
+            toValue: -Dimensions.get('window').width,
+            duration: 200,
+            useNativeDriver: true,
+        }).start(() => setMenuVisible(false));
+    };
 
     useEffect(() => {
+        navigation.setOptions({
+            headerRight: () => (
+                <TouchableOpacity
+                    onPress={openMenu}
+                    style={{ marginRight: 15 }}
+                >
+                    <Ionicons name="menu" size={28} color="#fff" />
+                </TouchableOpacity>
+            ),
+        });
+        
         initDB().catch(console.log);
-        getLocationWithRetry();
         initializeTime();
+        getLocation();
 
         const interval = setInterval(() => {
             updateCurrentTime();
@@ -54,7 +80,7 @@ export default function Home() {
             console.log('Error inicializando hora:', error);
         }
     };
-
+    
     const updateCurrentTime = async () => {
         try {
             const now = await getCurrentAppTime();
@@ -64,7 +90,7 @@ export default function Home() {
             console.log('Error actualizando hora:', error);
         }
     };
-
+    
     const formatDateTime = (date: Date) => {
         const year = date.getFullYear();
         const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -74,142 +100,88 @@ export default function Home() {
         const seconds = String(date.getSeconds()).padStart(2, '0');
         return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
     };
-
-    const getLocationWithRetry = async () => {
-        setLocationLoading(true);
-        setLocationError(null);
-        locationRetryCount.current = 0;
-        
-        await attemptGetLocation();
-    };
-
-    const attemptGetLocation = async () => {
+    
+    const getLocation = async () => {
         try {
-            // Primero intentar con alta precisión
-            console.log('Intentando obtener ubicación con alta precisión...');
-            const location = await getLocationWithAccuracy(Location.Accuracy.High);
-            
-            if (location) {
-                console.log('✅ Ubicación obtenida con alta precisión');
-                setLocation(location);
-                setUsingBalancedMode(false);
-                setLocationError(null);
-                setLocationLoading(false);
+            setLocationLoading(true);
+            setLocationError(null);
+
+            if (!Device.isDevice) {
+                setLocation(null);
+                setLocationError('Emuladores no permitidos');
                 return;
             }
-        } catch (error: any) {
-            console.log('GPS de alta precisión falló:', error.message);
-            
-            // Si falla, intentar con modo balanceado
-            if (locationRetryCount.current < maxRetries) {
-                locationRetryCount.current++;
-                console.log(`Reintento ${locationRetryCount.current}/${maxRetries} con modo balanceado...`);
-                
-                try {
-                    const balancedLocation = await getLocationWithAccuracy(Location.Accuracy.Balanced);
-                    
-                    if (balancedLocation) {
-                        console.log('✅ Ubicación obtenida con modo balanceado');
-                        setLocation(balancedLocation);
-                        setUsingBalancedMode(true);
-                        setLocationError(null);
-                        setLocationLoading(false);
-                        
-                        // Mostrar alerta informativa solo una vez
-                        if (locationRetryCount.current === 1) {
-                            Alert.alert(
-                                '⚠️ Precisión reducida',
-                                'Usando ubicación aproximada. La precisión puede ser menor.',
-                                [{ text: 'Entendido' }]
-                            );
-                        }
-                        return;
-                    }
-                } catch (balancedError: any) {
-                    console.log('Modo balanceado también falló:', balancedError.message);
-                }
-            }
-        }
-        
-        // Si todos los intentos fallaron
-        setLocation(null);
-        setLocationLoading(false);
-        setLocationError('No se pudo obtener la ubicación. Verifica que los servicios de ubicación estén activados.');
-        
-        Alert.alert(
-            '❌ Error de Ubicación',
-            'No se pudo obtener tu ubicación. Por favor:\n\n' +
-            '1. Activa el GPS de tu dispositivo\n' +
-            '2. Permite el acceso a la ubicación\n' +
-            '3. Verifica que tengas señal GPS\n\n' +
-            '¿Quieres reintentar?',
-            [
-                { text: 'Cancelar', style: 'cancel' },
-                { 
-                    text: 'Reintentar', 
-                    onPress: () => getLocationWithRetry()
-                }
-            ]
-        );
-    };
 
-    const getLocationWithAccuracy = async (accuracy: Location.Accuracy) => {
-        try {
-            // Solicitar permisos
+            const enabled = await Location.hasServicesEnabledAsync();
+            if (!enabled) {
+                setLocation(null);
+                setLocationError('GPS desactivado');
+                return;
+            }
+
             const { status } = await Location.requestForegroundPermissionsAsync();
-            
             if (status !== 'granted') {
-                throw new Error('Permiso de ubicación denegado');
+                setLocation(null);
+                setLocationError('Permiso de ubicación denegado');
+                return;
             }
 
-            // Configurar opciones según precisión
-            const options: Location.LocationOptions = {
-                accuracy: accuracy,
-                timeout: accuracy === Location.Accuracy.High ? 15000 : 10000, // 15s para GPS, 10s para balanceado
-                maximumAge: accuracy === Location.Accuracy.High ? 1000 : 5000, // 1s para GPS, 5s para balanceado
-            };
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('TIMEOUT')), 10000)
+            );
 
-            // Intentar obtener ubicación
-            const location = await Location.getCurrentPositionAsync(options);
-            
-            // Validar que la ubicación sea razonable
-            if (location && location.coords) {
-                // Verificar que las coordenadas no sean cero
-                if (location.coords.latitude === 0 && location.coords.longitude === 0) {
-                    throw new Error('Coordenadas inválidas (0,0)');
-                }
-                
-                // Verificar precisión si es modo GPS
-                if (accuracy === Location.Accuracy.High && location.coords.accuracy > 100) {
-                    console.log(`Precisión baja en modo GPS: ${location.coords.accuracy}m`);
-                    // Aún así la devolvemos, pero con advertencia
-                }
-                
-                return location.coords;
+            const locationPromise = Location.getCurrentPositionAsync({
+                accuracy: Location.Accuracy.High,
+            });
+
+            const currentLocation: any = await Promise.race([
+                locationPromise,
+                timeoutPromise,
+            ]);
+
+            if (!currentLocation?.coords) {
+                throw new Error('Sin coordenadas');
             }
-            
-            throw new Error('No se recibieron coordenadas válidas');
-            
+
+            if (currentLocation.mocked) {
+                setLocation(null);
+                setLocationError('Ubicación falsa detectada');
+                return;
+            }
+
+            if (currentLocation.coords.accuracy && currentLocation.coords.accuracy < 5) {
+                setLocation(null);
+                setLocationError('GPS sospechoso detectado');
+                return;
+            }
+
+            if (currentLocation.coords.accuracy && currentLocation.coords.accuracy > 100) {
+                setLocation(null);
+                setLocationError('GPS con baja precisión');
+                return;
+            }
+
+            setLocation(currentLocation.coords);
+            setLocationError(null);
         } catch (error: any) {
-            console.log(`Error en getLocationWithAccuracy (${accuracy}):`, error.message);
-            
-            // Errores específicos
-            if (error.message.includes('LOCATION_UNAVAILABLE')) {
-                throw new Error('GPS no disponible');
-            } else if (error.message.includes('TIMEOUT')) {
-                throw new Error('Tiempo de espera agotado');
+            console.log('GPS ERROR:', error);
+            let mensaje = 'No se pudo obtener GPS';
+            if (error?.message === 'TIMEOUT') {
+                mensaje = 'GPS tardó demasiado. Activa alta precisión.';
             }
-            
-            throw error;
+            setLocation(null);
+            setLocationError(mensaje);
+        } finally {
+            setLocationLoading(false);
         }
     };
-
+    
     const saveAttendance = async () => {
         try {
             setLoading(true);
-
+            
             const [fecha, hora] = currentTime.split(' ');
-
+            
             await guardarAsistencia({
                 email,
                 tipo,
@@ -219,65 +191,44 @@ export default function Home() {
                 lat: location?.latitude?.toString() || '',
                 lng: location?.longitude?.toString() || '',
             });
-
-            const precisionMsg = usingBalancedMode ? 
-                '\n⚠️ Ubicación con precisión reducida' : 
-                '\n✅ Ubicación precisa (GPS)';
-
+            
             Alert.alert(
                 '✅ Éxito',
-                `Asistencia registrada\n\n` +
-                `Hora: ${currentTime}\n` +
-                `Latitud: ${location?.latitude}\n` +
-                `Longitud: ${location?.longitude}\n` +
-                `Precisión: ${location?.accuracy?.toFixed(1) || 'N/A'}m${precisionMsg}`
+                `Asistencia registrada correctamente\n\n` +
+                `📧 Email: ${email}\n` +
+                `⏰ Hora: ${currentTime}\n` +
+                `📍 Ubicación: ${location?.latitude?.toFixed(6)}, ${location?.longitude?.toFixed(6)}\n` +
+                `📝 Tipo: ${tipo}`
             );
-
-            setEmail('');
+            
             setObservacion('');
-            
-            // Opcional: refrescar ubicación después de guardar
-            setTimeout(() => {
-                getLocationWithRetry();
-            }, 1000);
-            
         } catch (error) {
-            console.log('Error guardando asistencia:', error);
-            Alert.alert(
-                '❌ Error',
-                'No se pudo guardar la asistencia. Intenta nuevamente.'
-            );
+            console.log('Error guardando:', error);
+            Alert.alert('❌ Error', 'No se pudo guardar la asistencia. Intenta nuevamente.');
         } finally {
             setLoading(false);
         }
     };
-
+    
     const handleGuardar = async () => {
         if (!email) {
             Alert.alert('Error', 'Ingresa un email');
             return;
         }
-
+        
         if (!email.includes('@')) {
             Alert.alert('Error', 'Email inválido');
             return;
         }
-
+        
         if (!location) {
-            Alert.alert(
-                'Error', 
-                locationError || 'No hay ubicación disponible. Espera a que se obtenga o toca el botón de reintentar.'
-            );
+            Alert.alert('⚠️ Sin ubicación', 'Primero debes obtener tu ubicación');
             return;
         }
-
+        
         saveAttendance();
     };
-
-    const handleRefreshLocation = () => {
-        getLocationWithRetry();
-    };
-
+    
     return (
         <KeyboardAvoidingView
             style={styles.container}
@@ -289,8 +240,9 @@ export default function Home() {
                     <Text style={styles.title}>MindepoApp</Text>
                     <Text style={styles.subtitle}>Registro de Asistencia</Text>
                 </View>
-
+                
                 <View style={styles.formContainer}>
+                    {/* Banner hora servidor */}
                     <View style={styles.serverBanner}>
                         <Ionicons name="cloud-done-outline" size={22} color="#27AE60" />
                         <View style={{ flex: 1 }}>
@@ -298,7 +250,8 @@ export default function Home() {
                             <Text style={styles.serverText}>La app NO usa la hora del celular</Text>
                         </View>
                     </View>
-
+                    
+                    {/* Email */}
                     <View style={styles.inputGroup}>
                         <Text style={styles.label}>Email</Text>
                         <View style={styles.inputWrapper}>
@@ -314,7 +267,8 @@ export default function Home() {
                             />
                         </View>
                     </View>
-
+                    
+                    {/* Hora servidor */}
                     <View style={styles.inputGroup}>
                         <Text style={styles.label}>Hora Servidor</Text>
                         <View style={styles.timeWrapper}>
@@ -323,7 +277,8 @@ export default function Home() {
                             <Ionicons name="checkmark-circle" size={20} color="#27AE60" style={styles.timeIcon} />
                         </View>
                     </View>
-
+                    
+                    {/* Tipo ingreso/salida */}
                     <View style={styles.inputGroup}>
                         <Text style={styles.label}>Tipo</Text>
                         <View style={styles.tipoContainer}>
@@ -335,7 +290,7 @@ export default function Home() {
                                     Ingreso
                                 </Text>
                             </TouchableOpacity>
-
+                            
                             <TouchableOpacity
                                 style={[styles.tipoButton, tipo === 'Salida' && styles.tipoButtonSalida]}
                                 onPress={() => setTipo('Salida')}
@@ -346,7 +301,8 @@ export default function Home() {
                             </TouchableOpacity>
                         </View>
                     </View>
-
+                    
+                    {/* Observación */}
                     <View style={styles.inputGroup}>
                         <Text style={styles.label}>Observación</Text>
                         <View style={styles.inputWrapper}>
@@ -360,76 +316,246 @@ export default function Home() {
                             />
                         </View>
                     </View>
-
-                    <View style={styles.locationInfo}>
-                        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                                <Ionicons name="location-outline" size={20} color="#4A90E2" />
-                                <Text style={styles.locationTitle}>Ubicación</Text>
-                            </View>
-                            <TouchableOpacity onPress={handleRefreshLocation}>
-                                <Ionicons name="refresh-outline" size={20} color="#4A90E2" />
-                            </TouchableOpacity>
-                        </View>
-
+                    
+                    {/* Sección de ubicación */}
+                    <View style={styles.locationSection}>
+                        <Text style={styles.sectionTitle}>📍 Ubicación GPS</Text>
+                        
                         {locationLoading ? (
-                            <View style={{ alignItems: 'center', padding: 20 }}>
+                            <View style={styles.loadingLocationContainer}>
                                 <ActivityIndicator size="large" color="#4A90E2" />
-                                <Text style={styles.loadingText}>Obteniendo ubicación...</Text>
+                                <Text style={styles.loadingLocationText}>
+                                    Obteniendo ubicación...
+                                </Text>
                             </View>
-                        ) : location ? (
-                            <View style={{ flex: 1 }}>
-                                {usingBalancedMode && (
-                                    <View style={styles.warningBadge}>
-                                        <Ionicons name="warning-outline" size={14} color="#E67E22" />
-                                        <Text style={styles.warningText}>Precisión reducida</Text>
-                                    </View>
-                                )}
+                        ) : !location ? (
+                            <TouchableOpacity
+                                style={styles.getLocationButton}
+                                onPress={getLocation}
+                            >
+                                <Ionicons name="refresh" size={24} color="#FFF" />
+                                <Text style={styles.getLocationButtonText}>
+                                    Reintentar GPS
+                                </Text>
+                            </TouchableOpacity>
+                        ) : (
+                            <View style={styles.locationInfo}>
+                                <View style={styles.locationCard}>
+                                    <Ionicons name="checkmark-circle" size={24} color="#27AE60" />
+                                    <Text style={styles.locationStatus}>
+                                        GPS conectado correctamente
+                                    </Text>
+                                </View>
                                 
-                                <Text style={styles.locationText}>📍 Ubicación obtenida</Text>
-                                <Text style={styles.coords}>LAT: {location.latitude.toFixed(6)}</Text>
-                                <Text style={styles.coords}>LNG: {location.longitude.toFixed(6)}</Text>
-                                {location.accuracy && (
-                                    <Text style={styles.coords}>Precisión: ±{location.accuracy.toFixed(1)}m</Text>
-                                )}
-
+                                <View style={styles.coordinatesCard}>
+                                    <Text style={styles.coordText}>
+                                        📍 Latitud: {location.latitude.toFixed(6)}
+                                    </Text>
+                                    <Text style={styles.coordText}>
+                                        🗺️ Longitud: {location.longitude.toFixed(6)}
+                                    </Text>
+                                    {location.accuracy && (
+                                        <Text style={styles.coordText}>
+                                            🎯 Precisión: ±{location.accuracy.toFixed(1)}m
+                                        </Text>
+                                    )}
+                                </View>
+                                
                                 <TouchableOpacity
                                     onPress={() => {
-                                        const url = `https://www.google.com/maps?q=${location.latitude},${location.longitude}`;
+                                        const url = `https://www.google.com/maps/search/?api=1&query=${location.latitude},${location.longitude}`;
                                         Linking.openURL(url);
                                     }}
                                     style={styles.mapButton}
                                 >
-                                    <Ionicons name="map-outline" size={18} color="#FFF" />
+                                    <Ionicons name="map" size={20} color="#FFF" />
                                     <Text style={styles.mapButtonText}>Ver en Google Maps</Text>
                                 </TouchableOpacity>
-                            </View>
-                        ) : (
-                            <View>
-                                <Text style={styles.locationError}>❌ {locationError || 'Sin ubicación'}</Text>
-                                <TouchableOpacity onPress={handleRefreshLocation} style={styles.retryButton}>
-                                    <Ionicons name="refresh" size={16} color="#4A90E2" />
-                                    <Text style={styles.retryButtonText}>Reintentar</Text>
+                                
+                                <TouchableOpacity
+                                    onPress={() => {
+                                        setLocation(null);
+                                        getLocation();
+                                    }}
+                                    style={styles.refreshLocationButton}
+                                >
+                                    <Ionicons name="refresh" size={18} color="#4A90E2" />
+                                    <Text style={styles.refreshLocationText}>Actualizar ubicación</Text>
                                 </TouchableOpacity>
                             </View>
                         )}
+                        
+                        {locationError && !locationLoading && (
+                            <View style={styles.errorContainer}>
+                                <Ionicons name="alert-circle" size={20} color="#E74C3C" />
+                                <Text style={styles.errorText}>{locationError}</Text>
+                            </View>
+                        )}
                     </View>
-
+                    
+                    {/* Botón registrar */}
                     <TouchableOpacity
-                        style={[styles.submitButton, (loading || locationLoading) && styles.submitButtonDisabled]}
+                        style={[
+                            styles.submitButton,
+                            (!location || loading || locationLoading) && styles.submitButtonDisabled
+                        ]}
                         onPress={handleGuardar}
-                        disabled={loading || locationLoading}
+                        disabled={!location || loading || locationLoading}
                     >
                         {loading ? (
                             <ActivityIndicator color="#FFF" />
                         ) : (
                             <>
                                 <Ionicons name="checkmark-circle-outline" size={24} color="#FFF" />
-                                <Text style={styles.submitButtonText}>Registrar</Text>
+                                <Text style={styles.submitButtonText}>
+                                    {locationLoading
+                                        ? 'Obteniendo GPS...'
+                                        : !location
+                                        ? 'Esperando ubicación...'
+                                        : 'Registrar Asistencia'}
+                                </Text>
                             </>
                         )}
                     </TouchableOpacity>
                 </View>
+
+                <Modal 
+                    transparent 
+                    visible={menuVisible} 
+                    animationType="none"
+                    onRequestClose={closeMenu}
+                >
+                    <Pressable
+                        style={styles.modalOverlay}
+                        onPress={closeMenu}
+                    />
+
+                    <Animated.View
+                        style={[
+                            styles.menuPanel,
+                            { transform: [{ translateX: slideAnim }] }
+                        ]}
+                    >
+                        {/* Perfil de usuario - usando datos reales del contexto */}
+                        <View style={styles.userSection}>
+                            <View style={styles.userAvatar}>
+                                <Text style={styles.userInitials}>
+                                    {user?.name?.charAt(0).toUpperCase() || 
+                                     user?.email?.charAt(0).toUpperCase() || 
+                                     'U'}
+                                </Text>
+                            </View>
+                            <Text style={styles.userName}>
+                                {user?.name || 
+                                 user?.email?.split('@')[0] || 
+                                 'Bienvenido'}
+                            </Text>
+                            <Text style={styles.userEmail}>
+                                {user?.email || 'usuario@ejemplo.com'}
+                            </Text>
+                        </View>
+
+                        {/* Opciones de navegación */}
+                        <View style={styles.navSection}>
+                            <TouchableOpacity 
+                                style={styles.navItem}
+                                onPress={() => {
+                                    closeMenu();
+                                    router.push('/(tabs)');
+                                }}
+                            >
+                                <View style={styles.navIcon}>
+                                    <Ionicons name="home-outline" size={22} color="#718096" />
+                                </View>
+                                <Text style={styles.navLabel}>
+                                    Inicio
+                                </Text>
+                            </TouchableOpacity>
+
+                            <TouchableOpacity 
+                                style={styles.navItem}
+                                onPress={() => {
+                                    closeMenu();
+                                    // router.push('/asistencia');
+                                    closeMenu();
+                                }}
+                            >
+                                <View style={styles.navIcon}>
+                                    <Ionicons name="calendar-outline" size={22} color="#718096" />
+                                </View>
+                                <Text style={styles.navLabel}>
+                                    Mi Asistencia
+                                </Text>
+                            </TouchableOpacity>
+
+                            <TouchableOpacity 
+                                style={styles.navItem}
+                                onPress={() => {
+                                    closeMenu();
+                                    // router.push('/configuracion');
+                                    closeMenu();
+                                }}
+                            >
+                                <View style={styles.navIcon}>
+                                    <Ionicons name="settings-outline" size={22} color="#718096" />
+                                </View>
+                                <Text style={styles.navLabel}>
+                                    Configuración
+                                </Text>
+                            </TouchableOpacity>
+
+                            <TouchableOpacity 
+                                style={styles.navItem}
+                                onPress={() => {
+                                    closeMenu();
+                                    // router.push('/reportes');
+                                    closeMenu();
+                                }}
+                            >
+                                <View style={styles.navIcon}>
+                                    <Ionicons name="bar-chart-outline" size={22} color="#718096" />
+                                </View>
+                                <Text style={styles.navLabel}>
+                                    Reportes
+                                </Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity 
+                                style={styles.navItem}
+                                onPress={() => {
+                                    closeMenu();
+                                    router.push('/(tabs)/calendario');
+                                }}
+                            >
+                                <View style={styles.navIcon}>
+                                    <Ionicons name="calendar" size={22} color="#718096" />
+                                </View>
+                                <Text style={styles.navLabel}>
+                                    Calendario
+                                </Text>
+                            </TouchableOpacity>
+                        </View>
+
+                        <View style={styles.divider} />
+
+                        {/* Cerrar sesión */}
+                        <View style={styles.footerSection}>
+                            <TouchableOpacity
+                                style={styles.logoutItem}
+                                onPress={async () => {
+                                    await logout();
+                                    router.replace('/login');
+                                }}
+                            >
+                                <View style={styles.navIcon}>
+                                    <Ionicons name="log-out-outline" size={22} color="#E53E3E" />
+                                </View>
+                                <Text style={styles.logoutLabel}>
+                                    Cerrar sesión
+                                </Text>
+                            </TouchableOpacity>
+                        </View>
+                    </Animated.View>
+                </Modal>
             </ScrollView>
         </KeyboardAvoidingView>
     );
@@ -541,6 +667,8 @@ const styles = StyleSheet.create({
         borderRadius: 12,
         alignItems: 'center',
         borderWidth: 2,
+        borderColor: '#E1E8ED',
+        backgroundColor: '#F8F9FA',
     },
     tipoButtonIngreso: {
         backgroundColor: '#4A90E2',
@@ -552,83 +680,102 @@ const styles = StyleSheet.create({
     },
     tipoButtonText: {
         fontWeight: '600',
-        color: '#4A90E2',
+        color: '#666',
     },
     tipoButtonTextActive: {
         color: '#FFF',
     },
-    locationInfo: {
-        backgroundColor: '#F0F7FF',
-        padding: 12,
-        borderRadius: 12,
+    locationSection: {
         marginBottom: 24,
     },
-    locationTitle: {
+    sectionTitle: {
+        fontSize: 16,
         fontWeight: 'bold',
         color: '#2C3E50',
+        marginBottom: 12,
     },
-    loadingText: {
-        marginTop: 8,
-        color: '#7F8C8D',
-    },
-    warningBadge: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        backgroundColor: '#FEF5E7',
-        paddingHorizontal: 8,
-        paddingVertical: 4,
-        borderRadius: 6,
-        marginBottom: 8,
-        alignSelf: 'flex-start',
-        gap: 4,
-    },
-    warningText: {
-        fontSize: 11,
-        color: '#E67E22',
-    },
-    locationText: {
-        color: '#4A90E2',
-        fontWeight: 'bold',
-        marginTop: 4,
-    },
-    coords: {
-        fontSize: 12,
-        color: '#2C3E50',
-        marginTop: 2,
-    },
-    locationError: {
-        color: '#E74C3C',
-        marginBottom: 8,
-    },
-    mapButton: {
-        marginTop: 12,
+    getLocationButton: {
         backgroundColor: '#4A90E2',
-        paddingVertical: 10,
-        paddingHorizontal: 14,
-        borderRadius: 10,
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'center',
+        padding: 16,
+        borderRadius: 12,
+        gap: 10,
+    },
+    getLocationButtonText: {
+        color: '#FFF',
+        fontSize: 16,
+        fontWeight: '600',
+    },
+    locationInfo: {
+        gap: 10,
+    },
+    locationCard: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#E8F5E9',
+        padding: 12,
+        borderRadius: 10,
+        gap: 8,
+    },
+    locationStatus: {
+        fontSize: 14,
+        fontWeight: '600',
+        color: '#27AE60',
+    },
+    coordinatesCard: {
+        backgroundColor: '#F8F9FA',
+        padding: 12,
+        borderRadius: 10,
+        borderWidth: 1,
+        borderColor: '#E1E8ED',
+    },
+    coordText: {
+        fontSize: 13,
+        color: '#2C3E50',
+        marginVertical: 2,
+    },
+    mapButton: {
+        backgroundColor: '#34A853',
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 12,
+        borderRadius: 10,
         gap: 8,
     },
     mapButtonText: {
         color: '#FFF',
         fontWeight: '600',
+        fontSize: 14,
     },
-    retryButton: {
+    refreshLocationButton: {
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'center',
+        padding: 10,
+        borderRadius: 10,
         gap: 6,
-        paddingVertical: 8,
-        paddingHorizontal: 12,
         backgroundColor: '#E8F0FE',
-        borderRadius: 8,
-        marginTop: 8,
     },
-    retryButtonText: {
+    refreshLocationText: {
         color: '#4A90E2',
+        fontSize: 13,
         fontWeight: '500',
+    },
+    errorContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#FDEDEC',
+        padding: 12,
+        borderRadius: 10,
+        marginTop: 10,
+        gap: 8,
+    },
+    errorText: {
+        flex: 1,
+        color: '#E74C3C',
         fontSize: 13,
     },
     submitButton: {
@@ -638,7 +785,7 @@ const styles = StyleSheet.create({
         alignItems: 'center',
         padding: 16,
         borderRadius: 12,
-        gap: 8,
+        gap: 10,
     },
     submitButtonDisabled: {
         backgroundColor: '#BDC3C7',
@@ -647,5 +794,128 @@ const styles = StyleSheet.create({
         color: '#FFF',
         fontWeight: '600',
         fontSize: 16,
+    },
+
+    // ========== ESTILOS DEL MENÚ ELEGANTE ==========
+    
+    modalOverlay: {
+        flex: 1,
+        backgroundColor: 'rgba(0,0,0,0.3)',
+    },
+    
+    menuPanel: {
+        position: 'absolute',
+        left: 0,
+        top: 0,
+        bottom: 0,
+        width: '75%',
+        maxWidth: 320,
+        backgroundColor: '#FFF',
+        paddingTop: 80,
+        paddingHorizontal: 24,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 0 },
+        shadowOpacity: 0.1,
+        shadowRadius: 20,
+        elevation: 8,
+    },
+    
+    // Perfil de usuario - estilo moderno
+    userSection: {
+        marginBottom: 40,
+        borderBottomWidth: 1,
+        borderBottomColor: '#E8ECF0',
+        paddingBottom: 24,
+    },
+    
+    userAvatar: {
+        width: 80,
+        height: 80,
+        borderRadius: 40,
+        backgroundColor: '#F0F4F8',
+        justifyContent: 'center',
+        alignItems: 'center',
+        marginBottom: 16,
+    },
+    
+    userInitials: {
+        fontSize: 32,
+        fontWeight: '500',
+        color: '#4A90E2',
+    },
+    
+    userName: {
+        fontSize: 18,
+        fontWeight: '600',
+        color: '#1A202C',
+        marginBottom: 4,
+        letterSpacing: -0.3,
+    },
+    
+    userEmail: {
+        fontSize: 13,
+        color: '#718096',
+        letterSpacing: -0.2,
+    },
+    
+    // Navegación del menú
+    navSection: {
+        flex: 1,
+    },
+    
+    navItem: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingVertical: 12,
+        marginBottom: 4,
+        borderRadius: 12,
+    },
+    
+    navItemActive: {
+        backgroundColor: '#F0F7FF',
+    },
+    
+    navIcon: {
+        width: 32,
+        marginRight: 12,
+    },
+    
+    navLabel: {
+        fontSize: 15,
+        fontWeight: '500',
+        color: '#2D3748',
+        letterSpacing: -0.2,
+    },
+    
+    navLabelActive: {
+        color: '#4A90E2',
+        fontWeight: '600',
+    },
+    
+    // Separador elegante
+    divider: {
+        height: 1,
+        backgroundColor: '#E8ECF0',
+        marginVertical: 20,
+    },
+    
+    // Footer con logout
+    footerSection: {
+        marginTop: 'auto',
+        paddingBottom: 30,
+    },
+    
+    logoutItem: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingVertical: 12,
+        borderRadius: 12,
+    },
+    
+    logoutLabel: {
+        fontSize: 15,
+        fontWeight: '500',
+        color: '#E53E3E',
+        letterSpacing: -0.2,
     },
 });
